@@ -3,16 +3,18 @@ mod icmp;
 mod interface;
 mod oui;
 mod output;
+mod portscan;
+mod tui;
 mod types;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use ipnetwork::Ipv4Network;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use types::HostInfo;
 
 #[derive(Parser)]
@@ -23,7 +25,7 @@ struct Opts {
     target: Option<String>,
 
     /// Output format
-    #[arg(long, value_enum, default_value = "table")]
+    #[arg(long, value_enum, default_value = "tui")]
     output: OutputFormat,
 
     /// Resolve hostnames via reverse DNS
@@ -39,12 +41,17 @@ struct Opts {
 enum OutputFormat {
     Table,
     Json,
+    Tui,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    check_root()?;
     let opts = Opts::parse();
+    check_root()?;
+
+    if let OutputFormat::Tui = opts.output {
+        return run_tui(opts).await;
+    }
 
     let mut hosts = scan(&opts).await?;
 
@@ -61,9 +68,127 @@ async fn main() -> Result<()> {
     match opts.output {
         OutputFormat::Table => output::print_table(&hosts),
         OutputFormat::Json => output::print_json(&hosts)?,
+        OutputFormat::Tui => unreachable!(),
     }
 
     Ok(())
+}
+
+async fn run_tui(opts: Opts) -> Result<()> {
+    let scan_targets = compute_targets(&opts)?;
+    let target_str = opts
+        .target
+        .clone()
+        .unwrap_or_else(|| "auto-detected interfaces".to_string());
+
+    let (event_tx, event_rx) = mpsc::channel::<tui::ScanEvent>(512);
+
+    let concurrency = opts.concurrency;
+    let resolve = opts.resolve;
+    let scan_handle = tokio::spawn(async move {
+        scan_task(scan_targets, concurrency, resolve, event_tx).await;
+    });
+
+    tui::run(event_rx, target_str).await?;
+    scan_handle.abort();
+    Ok(())
+}
+
+async fn scan_task(
+    scan_targets: Vec<(interface::Interface, Vec<Ipv4Addr>)>,
+    concurrency: usize,
+    resolve: bool,
+    tx: mpsc::Sender<tui::ScanEvent>,
+) {
+    let mut found: HashSet<Ipv4Addr> = HashSet::new();
+
+    // ARP phase — runs per interface, blocks for 2s each
+    for (iface, ips) in &scan_targets {
+        let arp_results = arp::scan(iface, ips.clone(), Duration::from_secs(2)).await;
+        for (ip, mac) in arp_results {
+            if found.insert(ip) {
+                let vendor = oui::lookup(mac).map(str::to_string);
+                let host = HostInfo { ip, mac: Some(mac), hostname: None, vendor };
+                if tx.send(tui::ScanEvent::Host(host)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    // ICMP fallback — ping hosts that didn't respond to ARP, stream results
+    let remaining: Vec<Ipv4Addr> = scan_targets
+        .iter()
+        .flat_map(|(_, ips)| ips.iter().copied())
+        .filter(|ip| !found.contains(ip))
+        .collect();
+
+    let (icmp_tx, mut icmp_rx) = mpsc::channel::<Ipv4Addr>(256);
+    let sem = Arc::new(Semaphore::new(concurrency));
+
+    tokio::spawn(async move {
+        let mut handles = Vec::with_capacity(remaining.len());
+        for ip in remaining {
+            let sem = sem.clone();
+            let tx = icmp_tx.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                if icmp::ping(ip).await {
+                    tx.send(ip).await.ok();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.ok();
+        }
+        // icmp_tx dropped here, closing icmp_rx
+    });
+
+    while let Some(ip) = icmp_rx.recv().await {
+        found.insert(ip);
+        let host = HostInfo { ip, mac: None, hostname: None, vendor: None };
+        if tx.send(tui::ScanEvent::Host(host)).await.is_err() {
+            return;
+        }
+    }
+
+    // Hostname resolution (opt-in) — stream updates as DNS responds
+    if resolve {
+        let all_ips: Vec<Ipv4Addr> = found.into_iter().collect();
+        let sem = Arc::new(Semaphore::new(concurrency.min(64)));
+        let (dns_tx, mut dns_rx) = mpsc::channel::<(Ipv4Addr, String)>(256);
+
+        tokio::spawn(async move {
+            let mut handles = Vec::with_capacity(all_ips.len());
+            for ip in all_ips {
+                let sem = sem.clone();
+                let dtx = dns_tx.clone();
+                handles.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    let name = tokio::task::spawn_blocking(move || {
+                        dns_lookup::lookup_addr(&IpAddr::V4(ip)).ok()
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    if let Some(n) = name {
+                        dtx.send((ip, n)).await.ok();
+                    }
+                }));
+            }
+            for h in handles {
+                h.await.ok();
+            }
+        });
+
+        while let Some((ip, name)) = dns_rx.recv().await {
+            if tx.send(tui::ScanEvent::Hostname(ip, name)).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    tx.send(tui::ScanEvent::Done).await.ok();
 }
 
 fn check_root() -> Result<()> {
@@ -77,26 +202,29 @@ fn check_root() -> Result<()> {
     Ok(())
 }
 
+fn compute_targets(opts: &Opts) -> Result<Vec<(interface::Interface, Vec<Ipv4Addr>)>> {
+    if let Some(target_str) = &opts.target {
+        let network: Ipv4Network = target_str
+            .parse()
+            .with_context(|| format!("invalid CIDR: {target_str}"))?;
+        if network.prefix() < 16 {
+            anyhow::bail!("refusing to scan networks larger than /16");
+        }
+        let iface = interface::for_network(network)?;
+        Ok(vec![(iface, network_hosts(network))])
+    } else {
+        Ok(interface::list()?
+            .into_iter()
+            .map(|iface| {
+                let ips = network_hosts(iface.network);
+                (iface, ips)
+            })
+            .collect())
+    }
+}
+
 async fn scan(opts: &Opts) -> Result<Vec<HostInfo>> {
-    let scan_targets: Vec<(interface::Interface, Vec<Ipv4Addr>)> =
-        if let Some(target_str) = &opts.target {
-            let network: Ipv4Network = target_str
-                .parse()
-                .with_context(|| format!("invalid CIDR: {target_str}"))?;
-            if network.prefix() < 16 {
-                anyhow::bail!("refusing to scan networks larger than /16");
-            }
-            let iface = interface::for_network(network)?;
-            vec![(iface, network_hosts(network))]
-        } else {
-            interface::list()?
-                .into_iter()
-                .map(|iface| {
-                    let ips = network_hosts(iface.network);
-                    (iface, ips)
-                })
-                .collect()
-        };
+    let scan_targets = compute_targets(opts)?;
 
     // ARP sweep
     let mut found: HashMap<Ipv4Addr, Option<[u8; 6]>> = HashMap::new();

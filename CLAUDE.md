@@ -61,7 +61,7 @@ network-discover [OPTIONS]
 
 Options:
   --target <CIDR>        Subnet to scan (default: auto-detect)
-  --output <FORMAT>      Output format: table (default), json
+  --output <FORMAT>      Output format: tui (default), table, json
   --resolve              Enable reverse DNS hostname lookup
   --concurrency <N>      Max concurrent probes (default: 256)
   -h, --help             Print help
