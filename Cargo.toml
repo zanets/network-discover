@@ -4,3 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+comfy-table = "7"
+dns-lookup = "2"
+ipnetwork = "0.20"
+libc = "0.2"
+pnet = "0.35"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+surge-ping = "0.8"
+tokio = { version = "1", features = ["full"] }

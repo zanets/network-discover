@@ -1,0 +1,21 @@
+# OUI vendor lookup — partial list
+# Format: AABBCC<tab>Vendor Name (hex, no colons, uppercase)
+# Full database: https://regauth.standards.ieee.org/standards-ra-web/pub/view.html#registries
+
+000C29	VMware
+005056	VMware
+001C14	VMware
+080027	Oracle VirtualBox
+0A0027	Oracle VirtualBox
+525400	QEMU/KVM
+00163E	Xen
+001A11	Google
+B827EB	Raspberry Pi Foundation
+DCA632	Raspberry Pi Trading Ltd
+28CD4C	Raspberry Pi Trading Ltd
+3C2AF4	Raspberry Pi Trading Ltd
+D83ADD	Raspberry Pi Trading Ltd
+E4F8E6	Raspberry Pi Trading Ltd
+000D3A	Microsoft
+0050F2	Microsoft
+001DD8	Microsoft
