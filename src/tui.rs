@@ -17,9 +17,11 @@ use ratatui::{
 };
 use std::{
     io,
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr},
+    sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 
 // ── Public event type sent by the host scan task ──────────────────────────────
@@ -109,8 +111,9 @@ struct App {
     mode: Mode,
     port_scan: Option<PortScan>,
     wol_input: String,
-    // transient status message shown for ~2s after WoL is sent
     wol_status: Option<(String, u8)>,
+    resolving: bool,
+    hostname_rx: Option<mpsc::Receiver<(Ipv4Addr, String)>>,
 }
 
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -128,6 +131,8 @@ impl App {
             port_scan: None,
             wol_input: String::new(),
             wol_status: None,
+            resolving: false,
+            hostname_rx: None,
         }
     }
 
@@ -222,6 +227,37 @@ impl App {
         self.mode = Mode::HostList;
     }
 
+    fn start_resolve(&mut self) {
+        if self.hosts.is_empty() || self.resolving { return; }
+        let ips: Vec<Ipv4Addr> = self.hosts.iter().map(|h| h.ip).collect();
+        let (tx, rx) = mpsc::channel::<(Ipv4Addr, String)>(256);
+        self.hostname_rx = Some(rx);
+        self.resolving = true;
+        tokio::spawn(async move {
+            let sem = Arc::new(Semaphore::new(64));
+            let mut handles = Vec::with_capacity(ips.len());
+            for ip in ips {
+                let sem = sem.clone();
+                let tx = tx.clone();
+                handles.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    let name = tokio::task::spawn_blocking(move || {
+                        dns_lookup::lookup_addr(&IpAddr::V4(ip)).ok()
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    if let Some(n) = name {
+                        tx.send((ip, n)).await.ok();
+                    }
+                }));
+            }
+            for h in handles {
+                h.await.ok();
+            }
+        });
+    }
+
     fn spinner_char(&self) -> char {
         SPINNER[self.tick as usize % SPINNER.len()]
     }
@@ -274,14 +310,14 @@ async fn run_loop(
                                 _ => {}
                             },
                             Mode::PortScan => match code {
-                                KeyCode::Char('q') => break,
-                                KeyCode::Esc => app.close_port_scan(),
+                                KeyCode::Char('q') | KeyCode::Esc => app.close_port_scan(),
                                 _ => {}
                             },
                             Mode::HostList => match code {
-                                KeyCode::Char('q') | KeyCode::Esc => break,
+                                KeyCode::Char('q') => break,
                                 KeyCode::Enter => app.open_port_scan(),
                                 KeyCode::Char('w') => app.open_wol_input(),
+                                KeyCode::Char('r') if app.scan_done && !app.resolving => app.start_resolve(),
                                 KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
                                 KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
                                 _ => {}
@@ -305,6 +341,31 @@ async fn run_loop(
         // Drain port scan events
         if let Some(ps) = &mut app.port_scan {
             ps.drain();
+        }
+
+        // Drain hostname resolve events
+        if app.resolving {
+            let mut updates: Vec<(Ipv4Addr, String)> = Vec::new();
+            let mut resolve_done = false;
+            if let Some(hrx) = &mut app.hostname_rx {
+                loop {
+                    match hrx.try_recv() {
+                        Ok((ip, name)) => updates.push((ip, name)),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            resolve_done = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            for (ip, name) in updates {
+                app.update_hostname(ip, name);
+            }
+            if resolve_done {
+                app.resolving = false;
+                app.hostname_rx = None;
+            }
         }
 
         if last_tick.elapsed() >= tick_rate {
@@ -370,15 +431,16 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let status_line = if let Some((msg, _)) = &app.wol_status {
         Line::from(Span::styled(msg.clone(), Style::default().fg(Color::Yellow)))
     } else {
-        Line::from(vec![
-            if app.scan_done {
-                Span::styled("✓  Complete", Style::default().fg(Color::Green))
-            } else {
-                Span::styled(
-                    format!("{}  Scanning...", app.spinner_char()),
-                    Style::default().fg(Color::Green),
-                )
-            },
+        let scan_span = if app.scan_done {
+            Span::styled("✓  Complete", Style::default().fg(Color::Green))
+        } else {
+            Span::styled(
+                format!("{}  Scanning...", app.spinner_char()),
+                Style::default().fg(Color::Green),
+            )
+        };
+        let mut spans = vec![
+            scan_span,
             Span::raw("   "),
             Span::styled(
                 format!("{} host{}", app.hosts.len(), if app.hosts.len() == 1 { "" } else { "s" }),
@@ -386,7 +448,15 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::raw("   "),
             Span::styled(app.elapsed_str(), Style::default().fg(Color::DarkGray)),
-        ])
+        ];
+        if app.resolving {
+            spans.push(Span::raw("   "));
+            spans.push(Span::styled(
+                format!("{}  Resolving hostnames...", app.spinner_char()),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        Line::from(spans)
     };
     frame.render_widget(Paragraph::new(status_line), rows[1]);
 }
@@ -444,7 +514,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" port scan   "),
             Span::styled("w", Style::default().fg(Color::Yellow)),
             Span::raw(" Wake-on-LAN   "),
-            Span::styled("q / Esc", Style::default().fg(Color::Yellow)),
+            Span::styled("r", Style::default().fg(Color::Yellow)),
+            Span::raw(" resolve   "),
+            Span::styled("q", Style::default().fg(Color::Yellow)),
             Span::raw(" quit"),
         ],
     };
