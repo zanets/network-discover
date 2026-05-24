@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct HostInfo {
@@ -7,6 +8,7 @@ pub struct HostInfo {
     pub mac: Option<[u8; 6]>,
     pub hostname: Option<String>,
     pub vendor: Option<String>,
+    pub rtt: Option<Duration>,
 }
 
 impl HostInfo {
@@ -18,6 +20,12 @@ impl HostInfo {
             )
         })
     }
+
+    pub fn rtt_display(&self) -> String {
+        self.rtt.map_or(String::new(), |r| {
+            format!("{:.1} ms", r.as_secs_f64() * 1000.0)
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -26,6 +34,8 @@ pub struct HostInfoJson {
     pub mac: Option<String>,
     pub hostname: Option<String>,
     pub vendor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<f64>,
 }
 
 impl From<&HostInfo> for HostInfoJson {
@@ -36,6 +46,8 @@ impl From<&HostInfo> for HostInfoJson {
             mac: if mac.is_empty() { None } else { Some(mac) },
             hostname: h.hostname.clone(),
             vendor: h.vendor.clone(),
+            rtt_ms: h.rtt.map(|r| r.as_secs_f64() * 1000.0),
         }
     }
 }
+

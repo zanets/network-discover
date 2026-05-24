@@ -31,12 +31,14 @@
     *   TUI 上のホスト、または手動で入力した MAC アドレスに向けて、IEEE 802.3 規格に準拠したマジックパケットを簡単に送信可能。
 *   **🏢 100% オフラインでの MAC ベンダー名特定 (OUI)**
     *   MAC アドレス登録機関 (OUI) データベースをバイナリ内部にコンパイル時に組み込み。外部ネットワークに接続せず完全にオフライン環境でも、即座に製造元（Apple、Raspberry Pi、Intel、Synology など）を特定できます。
-*   **🔄 非同期逆引き DNS 解析**
-    *   スキャンされた IP に対応するホスト名をバックグラウンド非同期処理で解決し、ダッシュボードへ動的反映します。
+*   **🔄 ローカルサービスのアクティブ検出 (mDNS & SSDP)**
+    *   バックグラウンドで UDP マルチキャストおよびユニキャストを介して、アクティブなサービス（Apple AirPlay、ワークステーション、Google Cast、UPnP など）を自動検出します。無機質な IP/MAC アドレスを、人間にとって分かりやすいデバイスの別名（例: `"Sonos Play:1"`、`"Apple TV 4K"`）に置き換えます。
+*   **⏱️ リアルタイムネットワーク遅延の動的表示 (Ping RTT) [オプション]**
+    *   `--show-latency` オプションを指定して起動すると、TUI テーブル内に **"Latency"** 列が動的に挿入され、バックグラウンドで軽量な ICMP ping を定期的に全ホストへ送信してリアルタイムで応答速度（ミリ秒）を更新します。
 *   **📊 多彩な出力フォーマット**
     *   `tui`（標準）：動的な全画面インタラクティブダッシュボード。
     *   `table`：整形された表形式で標準出力へ出力。
-    *   `json`：スクリプト処理や他のツールとの連携が容易な、整形済みの構造化 JSON データ。
+    *   `json`：構造化 JSON データ（`--show-latency` 併用時は `rtt_ms` フィールドも自動出力）。
 
 ---
 
@@ -134,6 +136,7 @@ Options:
       --output <FORMAT>    出力形式: tui (標準), table, json
       --resolve            起動時に自動的に逆引き DNS 解析を実行 (非 TUI モード時)
       --concurrency <N>    最大並行プロブ数 [標準: 256]
+      --show-latency       リアルタイム遅延 (Ping RTT) 測定を有効化 (TUI/JSON モードのみサポート)
   -h, --help               ヘルプメッセージの表示
   -V, --version            バージョン情報の表示
 ```
@@ -154,6 +157,10 @@ Options:
 *   **ホスト名を逆引きしつつ、結果を JSON ファイルにエクスポート**:
     ```bash
     sudo ./target/release/network-discover --target 10.0.0.0/24 --output json --resolve > lan_hosts.json
+    ```
+*   **TUI 上でリアルタイムネットワーク遅延（レイテンシ）表示を有効にして起動**:
+    ```bash
+    sudo ./target/release/network-discover --show-latency
     ```
 
 ---
@@ -182,6 +189,7 @@ network-discover/
 ├── src/
 │   ├── main.rs             # CLI エントリーポイント。スキャンループと ICMP フォールバックの制御
 │   ├── types.rs            # データモデル定義 (HostInfo, HostInfoJson)
+│   ├── discovery.rs        # mDNS & SSDP によるローカルサービスのアクティブ検出と名前解決
 │   ├── interface.rs        # ローカルネットワークインターフェース一覧およびサブネットの検出
 │   ├── arp.rs              # ARP リクエスト送信およびキャプチャの制御
 │   ├── icmp.rs             # surge-ping を使用した ICMP ピン送信 (フォールバック)

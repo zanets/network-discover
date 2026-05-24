@@ -31,12 +31,14 @@
     *   TUI 模式下，選中主機或手動輸入 MAC 地址後，一鍵發送 IEEE 802.3 標準的網路喚醒魔術封包（Magic Packet）。
 *   **🏢 100% 離線 MAC 製造商識別 (OUI)**
     *   本地內置完整的 MAC 組織唯一識別碼數據庫，在沒有外網連接的離線狀態下，仍能瞬間解析設備製造商（如 Apple、Raspberry Pi、Intel、Synology 等）。
-*   **🔄 可選非同步域名解析**
-    *   支援對掃描出來的 IP 進行反向 DNS（Reverse DNS）解析，快速識別局域網設備名稱。
+*   **🔄 區域網路服務主動發現 (mDNS & SSDP)**
+    *   自動於背景透過 UDP 單播與多播探測常見服務（如 Apple AirPlay、工作站、Google Cast、UPnP 等），將冰冷難懂的 IP/MAC 替換為人類友好的設備別名（例如 `"Sonos Play:1"`、`"Apple TV 4K"`）。
+*   **⏱️ 可選實時網路延遲顯示 (Ping RTT)**
+    *   傳遞 `--show-latency` 參數可在 TUI 主表格中動態插入 **"Latency"** 欄位，並在背景以 3 秒為週期非同步發送輕量 ICMP 探測來動態更新設備延遲。
 *   **📊 多元化輸出格式**
     *   `tui`（預設）：豐富流暢的互動式終端介面。
-    *   `table`：乾淨漂亮的格式化表格，直接輸出至終端。
-    *   `json`：標準、結構化的 JSON 格式，便於腳本自動化處理或與其他工具 pipeline 整合。
+    *   `table`：乾淨漂亮的表格，直接輸出至終端。
+    *   `json`：標準結構化 JSON 格式（支援在啟用 `--show-latency` 時輸出 `rtt_ms`）。
 
 ---
 
@@ -134,6 +136,7 @@ Options:
       --output <FORMAT>    輸出格式: tui (預設), table, json
       --resolve            在啟動時自動進行反向 DNS 主機名稱解析 (若在非 TUI 模式下)
       --concurrency <N>    最大並行探測數 [預設: 256]
+      --show-latency       啟用實時網路延遲 (Ping RTT) 探測 (僅 TUI/JSON 支援)
   -h, --help               顯示幫助資訊
   -V, --version            顯示版本資訊
 ```
@@ -154,6 +157,10 @@ Options:
 *   **輸出 JSON 格式並啟用反向 DNS 解析（便於二次腳本解析）**：
     ```bash
     sudo ./target/release/network-discover --target 10.0.0.0/24 --output json --resolve > lan_hosts.json
+    ```
+*   **在 TUI 中啟用實時網路延遲探測輪詢**：
+    ```bash
+    sudo ./target/release/network-discover --show-latency
     ```
 
 ---
@@ -182,6 +189,7 @@ network-discover/
 ├── src/
 │   ├── main.rs             # CLI 程式入口，管理掃描任務調度與回退邏輯
 │   ├── types.rs            # 主機資訊結構體 (HostInfo, HostInfoJson) 定義
+│   ├── discovery.rs        # mDNS & SSDP 區域網路服務主動偵測與名稱解析
 │   ├── interface.rs        # 本地網卡介面列舉與網段偵測
 │   ├── arp.rs              # ARP 廣播探測與響應攔截
 │   ├── icmp.rs             # 基於 surge-ping 的 ICMP 探測回退

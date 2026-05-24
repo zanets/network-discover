@@ -31,12 +31,14 @@
     *   Send standard IEEE 802.3 Wake-on-LAN Magic Packets to target devices with a single keypress.
 *   **🏢 100% Offline MAC Vendor Lookup (OUI)**
     *   Bundles a MAC OUI database into the binary at compile time. Instantly translates MAC addresses to manufacturer names (e.g., Apple, Raspberry Pi, Intel, Synology) without any internet connection at runtime.
-*   **🔄 Reverse DNS Hostname Resolution**
-    *   Resolves local IP addresses to hostnames concurrently on demand using asynchronous reverse DNS lookups.
+*   **🔄 Active Local Service Discovery (mDNS & SSDP)**
+    *   Automatically probes active services (like Apple AirPlay, Workstations, Google Cast, and UPnP) via UDP multicast and unicast in the background. It replaces cryptic IP/MAC addresses with friendly device names (e.g., `"Sonos Play:1"`, `"Apple TV 4K"`).
+*   **⏱️ Optional Real-time Latency Monitoring (Ping RTT)**
+    *   Pass the `--show-latency` option to dynamically display a **"Latency"** column in the TUI table and periodically poll all active hosts in the background using lightweight ICMP pings.
 *   **📊 Versatile Output Formats**
     *   `tui` (Default): Interactive full-screen terminal experience.
     *   `table`: Clean, human-readable table printed via `comfy-table` to standard output.
-    *   `json`: Structured JSON format, ideal for scripts, piping, or automation workflows.
+    *   `json`: Structured JSON format (supports `rtt_ms` when `--show-latency` is enabled).
 
 ---
 
@@ -134,6 +136,7 @@ Options:
       --output <FORMAT>    Output format: tui (default), table, json
       --resolve            Perform reverse DNS lookup automatically (in non-TUI modes)
       --concurrency <N>    Maximum number of concurrent probes [default: 256]
+      --show-latency       Enable real-time network latency (Ping RTT) polling in TUI/JSON modes
   -h, --help               Print help information
   -V, --version            Print version information
 ```
@@ -154,6 +157,10 @@ Options:
 *   **Export scan results to a JSON file while resolving hostnames**:
     ```bash
     sudo ./target/release/network-discover --target 10.0.0.0/24 --output json --resolve > lan_hosts.json
+    ```
+*   **Scan current LAN with latency polling enabled in the TUI**:
+    ```bash
+    sudo ./target/release/network-discover --show-latency
     ```
 
 ---
@@ -182,6 +189,7 @@ network-discover/
 ├── src/
 │   ├── main.rs             # CLI entrypoint, orchestrates scan loop and fallback logic
 │   ├── types.rs            # Core models (HostInfo, HostInfoJson)
+│   ├── discovery.rs        # Active mDNS & SSDP friendly name resolution
 │   ├── interface.rs        # Local network interface listing and subnet detection
 │   ├── arp.rs              # ARP broadcasting and capturing logic
 │   ├── icmp.rs             # ICMP ping probing fallback via surge-ping

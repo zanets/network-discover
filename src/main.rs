@@ -1,5 +1,6 @@
 mod arp;
 mod banner;
+mod discovery;
 mod icmp;
 mod interface;
 mod oui;
@@ -37,6 +38,10 @@ struct Opts {
     /// Max concurrent probes
     #[arg(long, default_value = "256")]
     concurrency: usize,
+
+    /// Enable real-time network latency (Ping RTT) polling (TUI/JSON only)
+    #[arg(long)]
+    show_latency: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -87,11 +92,13 @@ async fn run_tui(opts: Opts) -> Result<()> {
 
     let concurrency = opts.concurrency;
     let resolve = opts.resolve;
+    let show_latency = opts.show_latency;
+    let tx_clone = event_tx.clone();
     let scan_handle = tokio::spawn(async move {
-        scan_task(scan_targets, concurrency, resolve, event_tx).await;
+        scan_task(scan_targets, concurrency, resolve, tx_clone).await;
     });
 
-    tui::run(event_rx, target_str).await?;
+    tui::run(event_rx, event_tx, target_str, show_latency).await?;
     scan_handle.abort();
     Ok(())
 }
@@ -110,10 +117,18 @@ async fn scan_task(
         for (ip, mac) in arp_results {
             if found.insert(ip) {
                 let vendor = oui::lookup(mac).map(str::to_string);
-                let host = HostInfo { ip, mac: Some(mac), hostname: None, vendor };
+                let host = HostInfo { ip, mac: Some(mac), hostname: None, vendor, rtt: None };
                 if tx.send(tui::ScanEvent::Host(host)).await.is_err() {
                     return;
                 }
+                
+                // Spawn friendly name probe (mDNS / SSDP) in parallel
+                let tx_clone = tx.clone();
+                tokio::spawn(async move {
+                    if let Some(friendly_name) = discovery::probe_friendly_name(ip).await {
+                        tx_clone.send(tui::ScanEvent::FriendlyName(ip, friendly_name)).await.ok();
+                    }
+                });
             }
         }
     }
@@ -148,10 +163,18 @@ async fn scan_task(
 
     while let Some(ip) = icmp_rx.recv().await {
         found.insert(ip);
-        let host = HostInfo { ip, mac: None, hostname: None, vendor: None };
+        let host = HostInfo { ip, mac: None, hostname: None, vendor: None, rtt: None };
         if tx.send(tui::ScanEvent::Host(host)).await.is_err() {
             return;
         }
+        
+        // Spawn friendly name probe (mDNS / SSDP) in parallel
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            if let Some(friendly_name) = discovery::probe_friendly_name(ip).await {
+                tx_clone.send(tui::ScanEvent::FriendlyName(ip, friendly_name)).await.ok();
+            }
+        });
     }
 
     // Hostname resolution (opt-in) — stream updates as DNS responds
@@ -261,7 +284,7 @@ async fn scan(opts: &Opts) -> Result<Vec<HostInfo>> {
 
     let mut hosts: Vec<HostInfo> = found
         .into_iter()
-        .map(|(ip, mac)| HostInfo { ip, mac, hostname: None, vendor: None })
+        .map(|(ip, mac)| HostInfo { ip, mac, hostname: None, vendor: None, rtt: None })
         .collect();
     hosts.sort_by_key(|h| h.ip);
     Ok(hosts)
@@ -287,13 +310,22 @@ async fn resolve_hostnames(hosts: &mut Vec<HostInfo>, concurrency: usize) {
         let sem = sem.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            let hostname = tokio::task::spawn_blocking(move || {
+            
+            // 1. Try DNS reverse lookup
+            let dns_name = tokio::task::spawn_blocking(move || {
                 dns_lookup::lookup_addr(&IpAddr::V4(ip)).ok()
             })
             .await
             .ok()
             .flatten();
-            (ip, hostname)
+            
+            // 2. Try mDNS / SSDP friendly name probe
+            let friendly_name = discovery::probe_friendly_name(ip).await;
+            
+            // Prefer friendly name, fallback to DNS reverse lookup name
+            let final_name = friendly_name.or(dns_name);
+            
+            (ip, final_name)
         }));
     }
 

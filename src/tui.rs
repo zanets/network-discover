@@ -29,6 +29,8 @@ use tokio::sync::mpsc;
 pub enum ScanEvent {
     Host(HostInfo),
     Hostname(Ipv4Addr, String),
+    FriendlyName(Ipv4Addr, String),
+    Rtt(Ipv4Addr, Duration),
     Done,
 }
 
@@ -114,12 +116,14 @@ struct App {
     wol_status: Option<(String, u8)>,
     resolving: bool,
     hostname_rx: Option<mpsc::Receiver<(Ipv4Addr, String)>>,
+    show_latency: bool,
+    rtt_task_spawned: bool,
 }
 
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 impl App {
-    fn new(target: String) -> Self {
+    fn new(target: String, show_latency: bool) -> Self {
         Self {
             hosts: Vec::new(),
             table_state: TableState::default(),
@@ -133,6 +137,8 @@ impl App {
             wol_status: None,
             resolving: false,
             hostname_rx: None,
+            show_latency,
+            rtt_task_spawned: false,
         }
     }
 
@@ -147,6 +153,12 @@ impl App {
     fn update_hostname(&mut self, ip: Ipv4Addr, name: String) {
         if let Ok(i) = self.hosts.binary_search_by_key(&ip, |h| h.ip) {
             self.hosts[i].hostname = Some(name);
+        }
+    }
+
+    fn update_rtt(&mut self, ip: Ipv4Addr, rtt: Duration) {
+        if let Ok(i) = self.hosts.binary_search_by_key(&ip, |h| h.ip) {
+            self.hosts[i].rtt = Some(rtt);
         }
     }
 
@@ -269,14 +281,19 @@ impl App {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub async fn run(mut rx: mpsc::Receiver<ScanEvent>, target: String) -> Result<()> {
+pub async fn run(
+    mut rx: mpsc::Receiver<ScanEvent>,
+    tx: mpsc::Sender<ScanEvent>,
+    target: String,
+    show_latency: bool,
+) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, &mut rx, target).await;
+    let result = run_loop(&mut terminal, &mut rx, tx, target, show_latency).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -287,9 +304,11 @@ pub async fn run(mut rx: mpsc::Receiver<ScanEvent>, target: String) -> Result<()
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     rx: &mut mpsc::Receiver<ScanEvent>,
+    tx: mpsc::Sender<ScanEvent>,
     target: String,
+    show_latency: bool,
 ) -> Result<()> {
-    let mut app = App::new(target);
+    let mut app = App::new(target, show_latency);
     let tick_rate = Duration::from_millis(80);
     let mut last_tick = Instant::now();
 
@@ -332,10 +351,44 @@ async fn run_loop(
         loop {
             match rx.try_recv() {
                 Ok(ScanEvent::Host(h)) => app.push_host(h),
+                Ok(ScanEvent::FriendlyName(ip, name)) => app.update_hostname(ip, name),
                 Ok(ScanEvent::Hostname(ip, name)) => app.update_hostname(ip, name),
+                Ok(ScanEvent::Rtt(ip, rtt)) => app.update_rtt(ip, rtt),
                 Ok(ScanEvent::Done) => app.scan_done = true,
                 Err(_) => break,
             }
+        }
+
+        // Trigger dynamic background RTT ping polling if enabled
+        if app.scan_done && app.show_latency && !app.rtt_task_spawned {
+            let tx_clone = tx.clone();
+            let ips: Vec<Ipv4Addr> = app.hosts.iter().map(|h| h.ip).collect();
+            tokio::spawn(async move {
+                loop {
+                    // Sweeping ping loop every 3 seconds
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    
+                    let sem = Arc::new(Semaphore::new(64));
+                    let mut handles = Vec::new();
+                    for ip in &ips {
+                        let ip = *ip;
+                        let sem = sem.clone();
+                        let tx_inner = tx_clone.clone();
+                        handles.push(tokio::spawn(async move {
+                            let _permit = sem.acquire().await.unwrap();
+                            let start = Instant::now();
+                            if crate::icmp::ping(ip).await {
+                                let rtt = start.elapsed();
+                                tx_inner.send(ScanEvent::Rtt(ip, rtt)).await.ok();
+                            }
+                        }));
+                    }
+                    for h in handles {
+                        h.await.ok();
+                    }
+                }
+            });
+            app.rtt_task_spawned = true;
         }
 
         // Drain port scan events
@@ -462,30 +515,68 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_host_table(frame: &mut Frame, app: &mut App, area: Rect) {
-    let col_header = Row::new(
-        ["IP Address", "MAC Address", "Vendor", "Hostname"]
-            .iter()
-            .map(|h| Cell::from(*h).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
-    )
-    .height(1);
+    let table = if app.show_latency {
+        let col_header = Row::new(
+            ["IP Address", "MAC Address", "Latency", "Vendor", "Hostname"]
+                .iter()
+                .map(|h| Cell::from(*h).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        )
+        .height(1);
 
-    let rows = app.hosts.iter().map(|h| {
-        Row::new([
-            Cell::from(h.ip.to_string()),
-            Cell::from(h.mac_display()),
-            Cell::from(h.vendor.as_deref().unwrap_or("").to_string()),
-            Cell::from(h.hostname.as_deref().unwrap_or("").to_string()),
-        ])
-    });
+        let rows = app.hosts.iter().map(|h| {
+            Row::new([
+                Cell::from(h.ip.to_string()),
+                Cell::from(h.mac_display()),
+                Cell::from(h.rtt_display()).style(Style::default().fg(Color::Green)),
+                Cell::from(h.vendor.as_deref().unwrap_or("").to_string()),
+                Cell::from(h.hostname.as_deref().unwrap_or("").to_string()),
+            ])
+        });
 
-    let table = Table::new(
-        rows,
-        [Constraint::Length(16), Constraint::Length(20), Constraint::Length(22), Constraint::Min(16)],
-    )
-    .header(col_header)
-    .block(Block::default().borders(Borders::ALL).title(" Hosts "))
-    .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
-    .highlight_symbol("▶ ");
+        Table::new(
+            rows,
+            [
+                Constraint::Length(15),
+                Constraint::Length(18),
+                Constraint::Length(10),
+                Constraint::Length(22),
+                Constraint::Min(15),
+            ],
+        )
+        .header(col_header)
+    } else {
+        let col_header = Row::new(
+            ["IP Address", "MAC Address", "Vendor", "Hostname"]
+                .iter()
+                .map(|h| Cell::from(*h).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        )
+        .height(1);
+
+        let rows = app.hosts.iter().map(|h| {
+            Row::new([
+                Cell::from(h.ip.to_string()),
+                Cell::from(h.mac_display()),
+                Cell::from(h.vendor.as_deref().unwrap_or("").to_string()),
+                Cell::from(h.hostname.as_deref().unwrap_or("").to_string()),
+            ])
+        });
+
+        Table::new(
+            rows,
+            [
+                Constraint::Length(16),
+                Constraint::Length(20),
+                Constraint::Length(22),
+                Constraint::Min(16),
+            ],
+        )
+        .header(col_header)
+    };
+
+    let table = table
+        .block(Block::default().borders(Borders::ALL).title(" Hosts "))
+        .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▶ ");
 
     frame.render_stateful_widget(table, area, &mut app.table_state);
 }
