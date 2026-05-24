@@ -6,7 +6,9 @@ on:
       - 'v*' # 當推送符合 v0.1.0 這種格式的 tag 時自動觸發
 
 permissions:
-  contents: write # 賦予建立與編輯 Release 及上傳二進位檔案的權限
+  contents: write      # 賦予建立與編輯 Release 及上傳二進位檔案的權限
+  id-token: write      # 產生成果證明 (Artifact Attestations) 的 OIDC Token 所需權限
+  attestations: write  # 儲存成果證明所需的權限
 
 jobs:
   build:
@@ -46,9 +48,28 @@ jobs:
       run: |
         mv target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }} target/${{ matrix.platform.target }}/release/${{ matrix.platform.name }}
 
+    - name: Generate Checksum (Linux)
+      if: matrix.platform.os == 'ubuntu-latest'
+      run: |
+        cd target/${{ matrix.platform.target }}/release
+        sha256sum ${{ matrix.platform.name }} > ${{ matrix.platform.name }}.sha256
+
+    - name: Generate Checksum (macOS)
+      if: matrix.platform.os == 'macos-latest'
+      run: |
+        cd target/${{ matrix.platform.target }}/release
+        shasum -a 256 ${{ matrix.platform.name }} > ${{ matrix.platform.name }}.sha256
+
+    - name: Generate Artifact Attestation
+      uses: actions/attest@v1
+      with:
+        subject-path: target/${{ matrix.platform.target }}/release/${{ matrix.platform.name }}
+
     - name: Release Asset
       uses: softprops/action-gh-release@v2
       with:
-        files: target/${{ matrix.platform.target }}/release/${{ matrix.platform.name }}
+        files: |
+          target/${{ matrix.platform.target }}/release/${{ matrix.platform.name }}
+          target/${{ matrix.platform.target }}/release/${{ matrix.platform.name }}.sha256
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
