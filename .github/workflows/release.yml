@@ -61,7 +61,7 @@ jobs:
         shasum -a 256 ${{ matrix.platform.name }} > ${{ matrix.platform.name }}.sha256
 
     - name: Generate Artifact Attestation
-      uses: actions/attest@v1
+      uses: actions/attest-build-provenance@v1
       with:
         subject-path: target/${{ matrix.platform.target }}/release/${{ matrix.platform.name }}
 
