@@ -1,5 +1,6 @@
 use crate::portscan::{self, PortResult, PortScanEvent};
 use crate::types::HostInfo;
+use crate::wol;
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -71,6 +72,11 @@ impl PortScan {
                     let pos = self.open_ports.partition_point(|p| p.port < r.port);
                     self.open_ports.insert(pos, r);
                 }
+                Ok(PortScanEvent::Banner { port, banner }) => {
+                    if let Ok(i) = self.open_ports.binary_search_by_key(&port, |p| p.port) {
+                        self.open_ports[i].banner = Some(banner);
+                    }
+                }
                 Ok(PortScanEvent::Progress { done, total }) => {
                     self.done = done;
                     self.total = total;
@@ -86,11 +92,7 @@ impl PortScan {
     }
 
     fn ratio(&self) -> f64 {
-        if self.total == 0 {
-            0.0
-        } else {
-            self.done as f64 / self.total as f64
-        }
+        if self.total == 0 { 1.0 } else { self.done as f64 / self.total as f64 }
     }
 }
 
@@ -105,6 +107,8 @@ struct App {
     target: String,
     mode: Mode,
     port_scan: Option<PortScan>,
+    // transient status message shown for ~2s after WoL is sent
+    wol_status: Option<(String, u8)>,
 }
 
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -120,6 +124,7 @@ impl App {
             target,
             mode: Mode::HostList,
             port_scan: None,
+            wol_status: None,
         }
     }
 
@@ -144,15 +149,9 @@ impl App {
     }
 
     fn scroll_down(&mut self) {
-        if self.hosts.is_empty() {
-            return;
-        }
+        if self.hosts.is_empty() { return; }
         let max = self.hosts.len() - 1;
-        let i = self
-            .table_state
-            .selected()
-            .map(|i| (i + 1).min(max))
-            .unwrap_or(0);
+        let i = self.table_state.selected().map(|i| (i + 1).min(max)).unwrap_or(0);
         self.table_state.select(Some(i));
     }
 
@@ -171,6 +170,20 @@ impl App {
             ps.abort();
         }
         self.mode = Mode::HostList;
+    }
+
+    fn trigger_wol(&mut self) {
+        let Some(idx) = self.table_state.selected() else { return };
+        let Some(host) = self.hosts.get(idx) else { return };
+        let msg = match host.mac {
+            Some(mac) => {
+                let ip = host.ip;
+                tokio::spawn(wol::send(mac));
+                format!("⚡ WoL sent → {ip}")
+            }
+            None => "✗  No MAC address (ICMP-only host)".to_string(),
+        };
+        self.wol_status = Some((msg, 25));
     }
 
     fn spinner_char(&self) -> char {
@@ -226,6 +239,11 @@ async fn run_loop(
                                 app.open_port_scan();
                             }
                         }
+                        KeyCode::Char('w') => {
+                            if app.mode == Mode::HostList {
+                                app.trigger_wol();
+                            }
+                        }
                         KeyCode::Up | KeyCode::Char('k') => {
                             if app.mode == Mode::HostList {
                                 app.scroll_up();
@@ -259,6 +277,11 @@ async fn run_loop(
 
         if last_tick.elapsed() >= tick_rate {
             app.tick = app.tick.wrapping_add(1);
+            // Countdown WoL status message
+            if let Some((_, ttl)) = &mut app.wol_status {
+                *ttl = ttl.saturating_sub(1);
+                if *ttl == 0 { app.wol_status = None; }
+            }
             last_tick = Instant::now();
         }
     }
@@ -270,13 +293,12 @@ async fn run_loop(
 
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4), // header (2 content + 2 borders)
-            Constraint::Min(0),    // table
-            Constraint::Length(1), // footer
+            Constraint::Length(4),
+            Constraint::Min(0),
+            Constraint::Length(1),
         ])
         .split(area);
 
@@ -286,8 +308,7 @@ fn render(frame: &mut Frame, app: &mut App) {
 
     if app.mode == Mode::PortScan {
         if let Some(ps) = &app.port_scan {
-            let popup = centered_rect(72, 78, area);
-            render_port_scan(frame, ps, popup, app.tick);
+            render_port_scan(frame, ps, centered_rect(82, 82, area), app.tick);
         }
     }
 }
@@ -302,19 +323,18 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Block::default().borders(Borders::ALL), area);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(
-                "nd",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("nd", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw("  "),
             Span::styled(app.target.clone(), Style::default().fg(Color::Yellow)),
         ])),
         rows[0],
     );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
+
+    // Second row: WoL status overrides scan status temporarily
+    let status_line = if let Some((msg, _)) = &app.wol_status {
+        Line::from(Span::styled(msg.clone(), Style::default().fg(Color::Yellow)))
+    } else {
+        Line::from(vec![
             if app.scan_done {
                 Span::styled("✓  Complete", Style::default().fg(Color::Green))
             } else {
@@ -325,31 +345,21 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             },
             Span::raw("   "),
             Span::styled(
-                format!(
-                    "{} host{}",
-                    app.hosts.len(),
-                    if app.hosts.len() == 1 { "" } else { "s" }
-                ),
+                format!("{} host{}", app.hosts.len(), if app.hosts.len() == 1 { "" } else { "s" }),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw("   "),
             Span::styled(app.elapsed_str(), Style::default().fg(Color::DarkGray)),
-        ])),
-        rows[1],
-    );
+        ])
+    };
+    frame.render_widget(Paragraph::new(status_line), rows[1]);
 }
 
 fn render_host_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let col_header = Row::new(
         ["IP Address", "MAC Address", "Vendor", "Hostname"]
             .iter()
-            .map(|h| {
-                Cell::from(*h).style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )
-            }),
+            .map(|h| Cell::from(*h).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
     )
     .height(1);
 
@@ -364,20 +374,11 @@ fn render_host_table(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let table = Table::new(
         rows,
-        [
-            Constraint::Length(16),
-            Constraint::Length(20),
-            Constraint::Length(22),
-            Constraint::Min(16),
-        ],
+        [Constraint::Length(16), Constraint::Length(20), Constraint::Length(22), Constraint::Min(16)],
     )
     .header(col_header)
     .block(Block::default().borders(Borders::ALL).title(" Hosts "))
-    .row_highlight_style(
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )
+    .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
     .highlight_symbol("▶ ");
 
     frame.render_stateful_widget(table, area, &mut app.table_state);
@@ -399,6 +400,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" scroll   "),
             Span::styled("Enter", Style::default().fg(Color::Yellow)),
             Span::raw(" port scan   "),
+            Span::styled("w", Style::default().fg(Color::Yellow)),
+            Span::raw(" Wake-on-LAN   "),
             Span::styled("q / Esc", Style::default().fg(Color::Yellow)),
             Span::raw(" quit"),
         ]
@@ -407,7 +410,6 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_port_scan(frame: &mut Frame, ps: &PortScan, area: Rect, tick: u8) {
-    // Clear the background area so the popup renders cleanly over the table
     frame.render_widget(Clear, area);
 
     let title = format!(" Port Scan: {} ", ps.ip);
@@ -415,14 +417,13 @@ fn render_port_scan(frame: &mut Frame, ps: &PortScan, area: Rect, tick: u8) {
         .borders(Borders::ALL)
         .title(title)
         .border_style(Style::default().fg(Color::Yellow));
-
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // status text
+            Constraint::Length(1), // status
             Constraint::Length(1), // progress bar
             Constraint::Length(1), // spacer
             Constraint::Min(0),    // port table
@@ -436,11 +437,7 @@ fn render_port_scan(frame: &mut Frame, ps: &PortScan, area: Rect, tick: u8) {
             Span::styled("✓  Complete", Style::default().fg(Color::Green)),
             Span::raw("   "),
             Span::styled(
-                format!(
-                    "{} open port{}",
-                    ps.open_ports.len(),
-                    if ps.open_ports.len() == 1 { "" } else { "s" }
-                ),
+                format!("{} open port{}", ps.open_ports.len(), if ps.open_ports.len() == 1 { "" } else { "s" }),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ])
@@ -457,10 +454,7 @@ fn render_port_scan(frame: &mut Frame, ps: &PortScan, area: Rect, tick: u8) {
             ),
             Span::raw("   "),
             Span::styled(
-                format!(
-                    "{} open",
-                    ps.open_ports.len(),
-                ),
+                format!("{} open", ps.open_ports.len()),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ])
@@ -468,39 +462,27 @@ fn render_port_scan(frame: &mut Frame, ps: &PortScan, area: Rect, tick: u8) {
     frame.render_widget(Paragraph::new(status), chunks[0]);
 
     // Progress gauge
-    let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
-        .ratio(ps.ratio());
-    frame.render_widget(gauge, chunks[1]);
+    frame.render_widget(
+        Gauge::default()
+            .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
+            .ratio(ps.ratio()),
+        chunks[1],
+    );
 
-    // Port table
+    // Port table (or placeholder)
     if ps.open_ports.is_empty() {
-        let msg = if ps.complete {
-            "No open ports found."
-        } else {
-            "Waiting for results..."
-        };
         frame.render_widget(
-            Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray))),
+            Paragraph::new(Span::styled(
+                if ps.complete { "No open ports found." } else { "Waiting for results..." },
+                Style::default().fg(Color::DarkGray),
+            )),
             chunks[3],
         );
     } else {
         let col_header = Row::new([
-            Cell::from("PORT").style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Cell::from("SERVICE").style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Cell::from("STATE").style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Cell::from("PORT").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Cell::from("SERVICE").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Cell::from("BANNER").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         ])
         .height(1);
 
@@ -508,21 +490,16 @@ fn render_port_scan(frame: &mut Frame, ps: &PortScan, area: Rect, tick: u8) {
             Row::new([
                 Cell::from(r.port.to_string()),
                 Cell::from(r.service),
-                Cell::from("open").style(Style::default().fg(Color::Green)),
+                Cell::from(r.banner.as_deref().unwrap_or("").to_string())
+                    .style(Style::default().fg(Color::DarkGray)),
             ])
         });
 
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(8),
-                Constraint::Length(18),
-                Constraint::Min(0),
-            ],
-        )
-        .header(col_header);
-
-        frame.render_widget(table, chunks[3]);
+        frame.render_widget(
+            Table::new(rows, [Constraint::Length(7), Constraint::Length(14), Constraint::Min(0)])
+                .header(col_header),
+            chunks[3],
+        );
     }
 
     // Footer hint

@@ -9,10 +9,12 @@ use tokio::sync::{mpsc, Semaphore};
 pub struct PortResult {
     pub port: u16,
     pub service: &'static str,
+    pub banner: Option<String>,
 }
 
 pub enum PortScanEvent {
     Open(PortResult),
+    Banner { port: u16, banner: String },
     Progress { done: usize, total: usize },
     Done,
 }
@@ -121,24 +123,32 @@ pub async fn scan(ip: Ipv4Addr, tx: mpsc::Sender<PortScanEvent>) {
         let done = done.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            let open = tokio::time::timeout(
+            let conn = tokio::time::timeout(
                 Duration::from_millis(500),
                 tokio::net::TcpStream::connect((ip, port)),
             )
-            .await
-            .map(|r| r.is_ok())
-            .unwrap_or(false);
+            .await;
 
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if open {
+            tx.send(PortScanEvent::Progress { done: n, total }).await.ok();
+
+            if let Ok(Ok(stream)) = conn {
                 tx.send(PortScanEvent::Open(PortResult {
                     port,
                     service: service_name(port),
+                    banner: None,
                 }))
                 .await
                 .ok();
+
+                // Grab banner asynchronously — port appears immediately, banner fills in
+                let tx2 = tx.clone();
+                tokio::spawn(async move {
+                    if let Some(b) = crate::banner::grab(stream, port, ip).await {
+                        tx2.send(PortScanEvent::Banner { port, banner: b }).await.ok();
+                    }
+                });
             }
-            tx.send(PortScanEvent::Progress { done: n, total }).await.ok();
         }));
     }
 
@@ -146,4 +156,5 @@ pub async fn scan(ip: Ipv4Addr, tx: mpsc::Sender<PortScanEvent>) {
         h.await.ok();
     }
     tx.send(PortScanEvent::Done).await.ok();
+    // Banner tasks may still be running; channel stays open until all tx clones drop
 }

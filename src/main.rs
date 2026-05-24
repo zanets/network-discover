@@ -1,4 +1,5 @@
 mod arp;
+mod banner;
 mod icmp;
 mod interface;
 mod oui;
@@ -6,6 +7,7 @@ mod output;
 mod portscan;
 mod tui;
 mod types;
+mod wol;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
