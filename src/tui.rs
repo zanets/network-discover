@@ -36,6 +36,7 @@ pub enum ScanEvent {
 enum Mode {
     HostList,
     PortScan,
+    WolInput,
 }
 
 // ── Port scan overlay state ───────────────────────────────────────────────────
@@ -107,6 +108,7 @@ struct App {
     target: String,
     mode: Mode,
     port_scan: Option<PortScan>,
+    wol_input: String,
     // transient status message shown for ~2s after WoL is sent
     wol_status: Option<(String, u8)>,
 }
@@ -124,6 +126,7 @@ impl App {
             target,
             mode: Mode::HostList,
             port_scan: None,
+            wol_input: String::new(),
             wol_status: None,
         }
     }
@@ -172,18 +175,51 @@ impl App {
         self.mode = Mode::HostList;
     }
 
-    fn trigger_wol(&mut self) {
-        let Some(idx) = self.table_state.selected() else { return };
-        let Some(host) = self.hosts.get(idx) else { return };
-        let msg = match host.mac {
-            Some(mac) => {
-                let ip = host.ip;
-                tokio::spawn(wol::send(mac));
-                format!("⚡ WoL sent → {ip}")
-            }
-            None => "✗  No MAC address (ICMP-only host)".to_string(),
-        };
-        self.wol_status = Some((msg, 25));
+    fn open_wol_input(&mut self) {
+        self.wol_input.clear();
+        self.mode = Mode::WolInput;
+    }
+
+    /// Append a hex nibble pair to the raw input (max 12 hex chars = 6 bytes).
+    fn wol_push(&mut self, c: char) {
+        if self.wol_input.len() < 12 && c.is_ascii_hexdigit() {
+            self.wol_input.push(c.to_ascii_uppercase());
+        }
+    }
+
+    fn wol_pop(&mut self) {
+        self.wol_input.pop();
+    }
+
+    /// Format raw hex as `AA:BB:CC:DD:EE:FF` with a trailing `_` cursor while incomplete.
+    fn wol_display(&self) -> String {
+        let mut out = String::with_capacity(17);
+        for (i, c) in self.wol_input.chars().enumerate() {
+            if i > 0 && i % 2 == 0 { out.push(':'); }
+            out.push(c);
+        }
+        let len = self.wol_input.len();
+        if len < 12 {
+            if len > 0 && len % 2 == 0 { out.push(':'); }
+            out.push('_');
+        }
+        out
+    }
+
+    fn wol_send(&mut self) {
+        if self.wol_input.len() != 12 {
+            self.wol_status = Some(("✗  Enter a full MAC address (12 hex digits)".to_string(), 25));
+            self.mode = Mode::HostList;
+            return;
+        }
+        let hex = &self.wol_input;
+        let bytes: [u8; 6] = std::array::from_fn(|i| {
+            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0)
+        });
+        let display = self.wol_display();
+        tokio::spawn(wol::send(bytes));
+        self.wol_status = Some((format!("⚡ WoL sent → {display}"), 25));
+        self.mode = Mode::HostList;
     }
 
     fn spinner_char(&self) -> char {
@@ -229,32 +265,28 @@ async fn run_loop(
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
-                        KeyCode::Char('q') => break,
-                        KeyCode::Esc => match app.mode {
-                            Mode::PortScan => app.close_port_scan(),
-                            Mode::HostList => break,
-                        },
-                        KeyCode::Enter => {
-                            if app.mode == Mode::HostList {
-                                app.open_port_scan();
-                            }
+                        code => match app.mode {
+                            Mode::WolInput => match code {
+                                KeyCode::Esc => app.mode = Mode::HostList,
+                                KeyCode::Enter => app.wol_send(),
+                                KeyCode::Backspace => app.wol_pop(),
+                                KeyCode::Char(c) => app.wol_push(c),
+                                _ => {}
+                            },
+                            Mode::PortScan => match code {
+                                KeyCode::Char('q') => break,
+                                KeyCode::Esc => app.close_port_scan(),
+                                _ => {}
+                            },
+                            Mode::HostList => match code {
+                                KeyCode::Char('q') | KeyCode::Esc => break,
+                                KeyCode::Enter => app.open_port_scan(),
+                                KeyCode::Char('w') => app.open_wol_input(),
+                                KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
+                                KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
+                                _ => {}
+                            },
                         }
-                        KeyCode::Char('w') => {
-                            if app.mode == Mode::HostList {
-                                app.trigger_wol();
-                            }
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            if app.mode == Mode::HostList {
-                                app.scroll_up();
-                            }
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if app.mode == Mode::HostList {
-                                app.scroll_down();
-                            }
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -310,6 +342,10 @@ fn render(frame: &mut Frame, app: &mut App) {
         if let Some(ps) = &app.port_scan {
             render_port_scan(frame, ps, centered_rect(82, 82, area), app.tick);
         }
+    }
+
+    if app.mode == Mode::WolInput {
+        render_wol_input(frame, app, centered_rect(52, 40, area));
     }
 }
 
@@ -385,16 +421,22 @@ fn render_host_table(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let spans = if app.mode == Mode::PortScan {
-        vec![
+    let spans = match app.mode {
+        Mode::PortScan => vec![
             Span::raw(" "),
             Span::styled("Esc", Style::default().fg(Color::Yellow)),
             Span::raw(" close scan   "),
             Span::styled("q", Style::default().fg(Color::Yellow)),
             Span::raw(" quit"),
-        ]
-    } else {
-        vec![
+        ],
+        Mode::WolInput => vec![
+            Span::raw(" "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(" send   "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw(" cancel"),
+        ],
+        Mode::HostList => vec![
             Span::raw(" "),
             Span::styled("↑↓ / jk", Style::default().fg(Color::Yellow)),
             Span::raw(" scroll   "),
@@ -404,7 +446,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" Wake-on-LAN   "),
             Span::styled("q / Esc", Style::default().fg(Color::Yellow)),
             Span::raw(" quit"),
-        ]
+        ],
     };
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -510,6 +552,45 @@ fn render_port_scan(frame: &mut Frame, ps: &PortScan, area: Rect, tick: u8) {
         ]))
         .alignment(Alignment::Right),
         chunks[4],
+    );
+}
+
+fn render_wol_input(frame: &mut Frame, app: &App, area: Rect) {
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Wake-on-LAN ")
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // label
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // input
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "MAC address of device to wake:",
+            Style::default().fg(Color::DarkGray),
+        )),
+        chunks[0],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("▶  ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                app.wol_display(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        chunks[2],
     );
 }
 
