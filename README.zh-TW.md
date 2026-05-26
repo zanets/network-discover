@@ -21,12 +21,17 @@
 *   **💻 強大的全螢幕 TUI 互動面板**
     *   基於 `ratatui` 與 `crossterm` 開發，介面精美、色彩和諧、響應流暢。
     *   支持實時動態數據流式渲染，掃描進度、耗時與發現設備數一目了然。
+
+    ![Main TUI Dashboard](assets/sh-mainpage.png)
+
 *   **🔍 互動式埠口掃描與服務 Banner 抓取**
     *   在 TUI 模式下，選中主機按下 `Enter` 即可發起**非同步並行埠口掃描**（內建 100+ 常見服務埠口）。
     *   **智慧型服務 Banner 解析**：
         *   對 SSH、FTP 等協議，自動擷取初始招呼語（Greeting）。
         *   對 HTTP 服務（80、8080、3000 等），自動發送 `HEAD` 請求並解析 `Server` 響應頭。
         *   對 Redis（6379），自動發送 `PING` 進行主動探測。
+
+    ![Port Scan Panel](assets/sh-portscan.png)
 *   **⚡ 非同步 Wake-on-LAN (WOL)**
     *   TUI 模式下，選中主機或手動輸入 MAC 地址後，一鍵發送 IEEE 802.3 標準的網路喚醒魔術封包（Magic Packet）。
 *   **🏢 100% 離線 MAC 製造商識別 (OUI)**

@@ -21,12 +21,17 @@
 *   **💻 Rich Full-Screen TUI Dashboard**
     *   Powered by `ratatui` and `crossterm` for a responsive, clean, and harmoniously color-coded interface.
     *   Streams live scanning progress, host count, and elapsed time dynamically.
+
+    ![Main TUI Dashboard](assets/sh-mainpage.png)
+
 *   **🔍 Interactive Port Scanning & Service Banner Grabbing**
     *   Press `Enter` on any host in the TUI to launch a **fully asynchronous parallel port scan** against 100+ well-known and registered ports.
     *   **Intelligent Banner Probing**:
         *   Retrieves standard greeting banners on connect for protocols like SSH, FTP, SMTP, POP3, etc.
         *   Sends HTTP `HEAD` requests to ports like 80, 8080, 3000 to extract the `Server` header value.
         *   Sends Redis `PING` command on port 6379 to actively probe status.
+
+    ![Port Scan Panel](assets/sh-portscan.png)
 *   **⚡ Asynchronous Wake-on-LAN (WOL)**
     *   Send standard IEEE 802.3 Wake-on-LAN Magic Packets to target devices with a single keypress.
 *   **🏢 100% Offline MAC Vendor Lookup (OUI)**
