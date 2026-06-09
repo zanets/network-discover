@@ -1,3 +1,4 @@
+use arboard::Clipboard;
 use crate::portscan::{self, PortResult, PortScanEvent};
 use crate::types::HostInfo;
 use crate::wol;
@@ -239,6 +240,18 @@ impl App {
         self.mode = Mode::HostList;
     }
 
+    fn copy_ip(&mut self) {
+        if let Some(idx) = self.table_state.selected() {
+            if idx < self.hosts.len() {
+                let ip = self.hosts[idx].ip.to_string();
+                match Clipboard::new().and_then(|mut cb| cb.set_text(&ip)) {
+                    Ok(()) => self.wol_status = Some((format!("✓  Copied {ip}"), 25)),
+                    Err(_) => self.wol_status = Some(("✗  Clipboard unavailable".to_string(), 25)),
+                }
+            }
+        }
+    }
+
     fn start_resolve(&mut self) {
         if self.hosts.is_empty() || self.resolving { return; }
         let ips: Vec<Ipv4Addr> = self.hosts.iter().map(|h| h.ip).collect();
@@ -335,10 +348,11 @@ async fn run_loop(
                             Mode::HostList => match code {
                                 KeyCode::Char('q') => break,
                                 KeyCode::Enter => app.open_port_scan(),
+                                KeyCode::Char('c') => app.copy_ip(),
                                 KeyCode::Char('w') => app.open_wol_input(),
                                 KeyCode::Char('r') if app.scan_done && !app.resolving => app.start_resolve(),
-                                KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
-                                KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
+                                KeyCode::Up => app.scroll_up(),
+                                KeyCode::Down => app.scroll_down(),
                                 _ => {}
                             },
                         }
@@ -599,10 +613,12 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         ],
         Mode::HostList => vec![
             Span::raw(" "),
-            Span::styled("↑↓ / jk", Style::default().fg(Color::Yellow)),
+            Span::styled("↑↓", Style::default().fg(Color::Yellow)),
             Span::raw(" scroll   "),
             Span::styled("Enter", Style::default().fg(Color::Yellow)),
             Span::raw(" port scan   "),
+            Span::styled("c", Style::default().fg(Color::Yellow)),
+            Span::raw(" copy IP   "),
             Span::styled("w", Style::default().fg(Color::Yellow)),
             Span::raw(" Wake-on-LAN   "),
             Span::styled("r", Style::default().fg(Color::Yellow)),

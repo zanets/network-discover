@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+arboard = "3"
 clap = { version = "4", features = ["derive"] }
 comfy-table = "7"
 crossterm = "0.29"

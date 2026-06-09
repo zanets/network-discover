@@ -176,7 +176,7 @@ When running in `tui` mode, you can control the dynamic dashboard with the follo
 
 | Key | Action | Description |
 | :--- | :--- | :--- |
-| **`↑ / ↓`** or **`j / k`** | **Navigate / Scroll** | Navigate up and down through the list of discovered live hosts. |
+| **`↑ / ↓`** | **Navigate / Scroll** | Navigate up and down through the list of discovered live hosts. |
 | **`Enter`** | **Port Scan / Close** | Trigger an asynchronous TCP port scan on the selected host. Dynamic scan progress, open ports, and banners will render in the side panel in real-time. Press again or press `Esc` to close. |
 | **`w`** | **Wake-on-LAN** | Open the Wake-on-LAN input dialog. If the selected host has a known MAC address, it is autofilled. Press `Enter` to send the magic packet. |
 | **`r`** | **Resolve Hostnames** | Perform background reverse DNS queries on all discovered hosts on demand once the initial sweep is complete. |
