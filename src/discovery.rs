@@ -121,7 +121,6 @@ fn encode_dns_query(service: &str) -> Vec<u8> {
 
 struct ResourceRecord {
     rr_type: u16,
-    rdata: Vec<u8>,
     rdata_absolute_offset: usize,
 }
 
@@ -186,102 +185,131 @@ fn parse_records(buf: &[u8]) -> Option<Vec<ResourceRecord>> {
         let rd_len = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]) as usize;
         offset += 10;
         if offset + rd_len > buf.len() { break; }
-        let rdata = buf[offset..offset + rd_len].to_vec();
-        
         records.push(ResourceRecord {
             rr_type,
-            rdata,
             rdata_absolute_offset: offset,
         });
-        
+
         offset += rd_len;
     }
-    
+
     Some(records)
 }
 
-async fn probe_mdns_type(ip: Ipv4Addr, service: &str) -> Option<String> {
+async fn probe_mdns(ip: Ipv4Addr) -> Option<String> {
+    // Reverse PTR lookup via unicast mDNS — macOS and Linux/Avahi respond to this
+    let [a, b, c, d] = ip.octets();
+    let reverse_name = format!("{}.{}.{}.{}.in-addr.arpa", d, c, b, a);
+
     let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
-    let query = encode_dns_query(service);
-    
-    // Send unicast mDNS directly to the target host's port 5353
+    let query = encode_dns_query(&reverse_name);
     socket.send_to(&query, (ip, 5353)).await.ok()?;
-    
-    let mut buf = [0u8; 2048];
+
+    let mut buf = [0u8; 512];
     let (len, _) = timeout(Duration::from_millis(500), socket.recv_from(&mut buf))
         .await
         .ok()?
         .ok()?;
-    
+
     let packet = &buf[..len];
     let rrs = parse_records(packet)?;
-    
-    // 1. First pass: look for TXT records with useful friendly names
+
     for rr in &rrs {
-        if rr.rr_type == 16 { // TXT
-            let mut txt_offset = 0;
-            while txt_offset < rr.rdata.len() {
-                let len = rr.rdata[txt_offset] as usize;
-                if txt_offset + 1 + len > rr.rdata.len() { break; }
-                let kv = String::from_utf8_lossy(&rr.rdata[txt_offset + 1..txt_offset + 1 + len]);
-                txt_offset += 1 + len;
-                
-                if let Some((k, v)) = kv.split_once('=') {
-                    let k_low = k.to_lowercase();
-                    if k_low == "fn" || k_low == "friendlyname" || k_low == "name" || k_low == "model" {
-                        if !v.is_empty() {
-                            return Some(v.to_string());
-                        }
-                    }
+        if rr.rr_type == 12 {
+            if let Some((name, _)) = read_name(packet, rr.rdata_absolute_offset) {
+                let hostname = name
+                    .trim_end_matches('.')
+                    .strip_suffix(".local")
+                    .unwrap_or(name.trim_end_matches('.'));
+                if !hostname.is_empty() && !hostname.starts_with('_') {
+                    return Some(hostname.to_string());
                 }
             }
         }
     }
-    
-    // 2. Second pass: fallback to decoding PTR domain name labels
-    for rr in &rrs {
-        if rr.rr_type == 12 { // PTR
-            if let Some((decoded_name, _)) = read_name(packet, rr.rdata_absolute_offset) {
-                if let Some((first_part, _)) = decoded_name.split_once('.') {
-                    if !first_part.starts_with('_') && !first_part.is_empty() {
-                        return Some(first_part.to_string());
-                    }
-                }
-            }
-        }
-    }
-    
+
     None
 }
 
-async fn probe_mdns(ip: Ipv4Addr) -> Option<String> {
-    // Try workstation service first, as it directly gives workstation name
-    if let Some(name) = probe_mdns_type(ip, "_workstation._tcp.local").await {
-        return Some(name);
+// ── NetBIOS Name Service (NBNS) ───────────────────────────────────────────────
+
+async fn probe_nbns(ip: Ipv4Addr) -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+
+    // Node Status Request: wildcard "*" encoded as NBT name
+    // '*' = 0x2A → high nibble 0x02 → 'C', low nibble 0x0A → 'K'
+    // remaining 15 null bytes → 30 × 'A'
+    let request: &[u8] = &[
+        0x12, 0x34, // Transaction ID
+        0x00, 0x10, // Flags: Node Status Request
+        0x00, 0x01, // Questions: 1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Answer/Authority/Additional RRs: 0
+        0x20, // NBT name length (32)
+        b'C', b'K', // '*' encoded
+        b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A',
+        b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A',
+        b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A',
+        b'A', b'A', b'A', b'A', b'A', b'A', // 30 × 'A'
+        0x00, // end of name
+        0x00, 0x21, // Type: NBSTAT
+        0x00, 0x01, // Class: IN
+    ];
+
+    socket.send_to(request, (ip, 137)).await.ok()?;
+
+    let mut buf = [0u8; 1024];
+    let (len, _) = timeout(Duration::from_millis(500), socket.recv_from(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+
+    // Standard NBSTAT response layout:
+    //   12B header + 38B question + 2B name-ptr + 2+2+4+2B RR header = RDATA at 62
+    if len < 63 {
+        return None;
     }
-    // Then try common HTTP web service
-    if let Some(name) = probe_mdns_type(ip, "_http._tcp.local").await {
-        return Some(name);
+    let num_names = buf[62] as usize;
+    if num_names == 0 || len < 63 + num_names * 18 {
+        return None;
     }
-    // Then try Google Chromecast
-    if let Some(name) = probe_mdns_type(ip, "_googlecast._tcp.local").await {
-        return Some(name);
+
+    for i in 0..num_names {
+        let base = 63 + i * 18;
+        let suffix = buf[base + 15];
+        let flags = u16::from_be_bytes([buf[base + 16], buf[base + 17]]);
+        // suffix 0x00 = workstation name; flag bit 15 = 0 means unique (not group)
+        if suffix == 0x00 && (flags & 0x8000) == 0 {
+            let name: String = buf[base..base + 15]
+                .iter()
+                .take_while(|&&b| b != b' ' && b != 0x00)
+                .map(|&b| b as char)
+                .collect();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
     }
+
     None
 }
 
 // ── Unified Probe Interface ───────────────────────────────────────────────────
 
 pub async fn probe_friendly_name(ip: Ipv4Addr) -> Option<String> {
-    // 1. Try mDNS first (targeted and structured)
+    // 1. mDNS reverse PTR (macOS, Linux/Avahi)
     if let Some(name) = probe_mdns(ip).await {
         return Some(name);
     }
-    
-    // 2. Fallback to SSDP UPnP XML descriptor
+
+    // 2. NetBIOS NBNS (Windows)
+    if let Some(name) = probe_nbns(ip).await {
+        return Some(name);
+    }
+
+    // 3. SSDP UPnP XML descriptor (routers, smart TVs, IoT)
     if let Some(name) = probe_ssdp(ip).await {
         return Some(name);
     }
-    
+
     None
 }
